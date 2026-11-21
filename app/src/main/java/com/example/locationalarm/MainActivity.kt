@@ -34,8 +34,9 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
-import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.util.GeoPoint
+import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
@@ -61,7 +62,6 @@ class MainActivity : AppCompatActivity() {
     private var radiusCircle: Polygon? = null
     private var myLocationOverlay: MyLocationNewOverlay? = null
 
-    // Data class for autocomplete suggestions
     data class PlaceSuggestion(val displayName: String, val lat: Double, val lon: Double)
 
     private var searchJob: Job? = null
@@ -89,8 +89,7 @@ class MainActivity : AppCompatActivity() {
             applicationContext,
             PreferenceManager.getDefaultSharedPreferences(applicationContext)
         )
-        // Unique User-Agent required by tile & search servers
-        osmConfig.userAgentValue = "OfflineLocationAlarmAndroid/1.0 (personal-commute-app)"
+        osmConfig.userAgentValue = "OfflineLocationAlarmAndroid/1.0"
 
         setContentView(R.layout.activity_main)
 
@@ -120,21 +119,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupMap() {
-        // Clear old cached 403 tiles if any exist
-        mapView.tileProvider.clearTileCache()
+        // Esri World Street Map (free public tiles, no API key required)
+        val esriStreetMap = object : OnlineTileSourceBase(
+            "EsriWorldStreetMap",
+            0, 19, 256, ".jpg",
+            arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/")
+        ) {
+            override fun getTileURLString(pMapTileIndex: Long): String {
+                val z = MapTileIndex.getZoom(pMapTileIndex)
+                val x = MapTileIndex.getX(pMapTileIndex)
+                val y = MapTileIndex.getY(pMapTileIndex)
+                return "$baseUrl$z/$y/$x"
+            }
+        }
 
-        // Use CartoDB Voyager (clean, Google-Maps-style street tiles without 403 blocks)
-        val cartoVoyager = XYTileSource(
-            "CartoVoyager",
-            0, 19, 256, ".png",
-            arrayOf(
-                "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
-                "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
-                "https://c.basemaps.cartocdn.com/rastertiles/voyager/"
-            ),
-            "© OpenStreetMap contributors © CARTO"
-        )
-        mapView.setTileSource(cartoVoyager)
+        mapView.setTileSource(esriStreetMap)
         mapView.setMultiTouchControls(true)
         mapView.controller.setZoom(15.0)
         mapView.controller.setCenter(GeoPoint(19.9975, 73.7898))
@@ -164,7 +163,6 @@ class MainActivity : AppCompatActivity() {
         )
         etSearchPlace.setAdapter(adapter)
 
-        // Fetch suggestions automatically as user types
         etSearchPlace.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
@@ -176,7 +174,7 @@ class MainActivity : AppCompatActivity() {
                 if (query.length < 3) return
 
                 searchJob = lifecycleScope.launch {
-                    delay(450L) // Wait 450ms after user stops typing
+                    delay(450L)
                     val results = fetchPlacesFromNominatim(query, limit = 5)
                     if (results.isNotEmpty()) {
                         currentSuggestions = results
@@ -191,7 +189,6 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        // Handle user tapping a suggestion from the dropdown list
         etSearchPlace.setOnItemClickListener { _, _, position, _ ->
             if (position in currentSuggestions.indices) {
                 val chosen = currentSuggestions[position]
@@ -200,7 +197,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Handle user clicking "Go" button
         btnSearch.setOnClickListener {
             val query = etSearchPlace.text.toString().trim()
             if (query.isNotEmpty()) {
@@ -240,7 +236,7 @@ class MainActivity : AppCompatActivity() {
 
                 val connection = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
-                    setRequestProperty("User-Agent", "OfflineLocationAlarmAndroid/1.0 (personal-commute-app)")
+                    setRequestProperty("User-Agent", "OfflineLocationAlarmAndroid/1.0")
                     connectTimeout = 8000
                     readTimeout = 8000
                 }
@@ -256,7 +252,6 @@ class MainActivity : AppCompatActivity() {
                     list.add(PlaceSuggestion(displayName, lat, lon))
                 }
             } catch (_: Exception) {
-                // Ignore network errors while typing offline
             }
             list
         }
