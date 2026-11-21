@@ -1,0 +1,368 @@
+package com.example.locationalarm
+
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.location.LocationManager
+import android.os.Build
+import android.os.Bundle
+import android.preference.PreferenceManager
+import android.provider.Settings
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.SeekBar
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.osmdroid.config.Configuration
+import org.osmdroid.events.MapEventsReceiver
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.MapEventsOverlay
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
+import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var mapView: MapView
+    private lateinit var tvSelectedCoords: TextView
+    private lateinit var tvRadiusLabel: TextView
+    private lateinit var seekBarRadius: SeekBar
+    private lateinit var tvStatus: TextView
+
+    private var selectedPoint: GeoPoint? = null
+    private var selectedRadiusMeters: Float = 500f
+
+    private var targetMarker: Marker? = null
+    private var radiusCircle: Polygon? = null
+    private var myLocationOverlay: MyLocationNewOverlay? = null
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val fineGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] ?: false
+        if (fineGranted) {
+            enableUserLocationOnMap()
+            if (selectedPoint != null) {
+                checkBackgroundPermissionAndStart()
+            }
+        } else {
+            Toast.makeText(this, "Fine Location permission is required!", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        Configuration.getInstance().load(
+            applicationContext,
+            PreferenceManager.getDefaultSharedPreferences(applicationContext)
+        )
+        Configuration.getInstance().userAgentValue = packageName
+
+        setContentView(R.layout.activity_main)
+
+        mapView = findViewById(R.id.mapView)
+        tvSelectedCoords = findViewById(R.id.tvSelectedCoords)
+        tvRadiusLabel = findViewById(R.id.tvRadiusLabel)
+        seekBarRadius = findViewById(R.id.seekBarRadius)
+        tvStatus = findViewById(R.id.tvStatus)
+
+        setupMap()
+        setupRadiusSlider()
+        setupSearchBar()
+
+        findViewById<Button>(R.id.btnStartAlarm).setOnClickListener {
+            validateAndStart()
+        }
+
+        findViewById<Button>(R.id.btnStopAlarm).setOnClickListener {
+            val stopIntent = Intent(this, LocationAlarmService::class.java).apply {
+                action = LocationAlarmService.ACTION_STOP
+            }
+            startService(stopIntent)
+            tvStatus.text = "Status: Alarm Stopped"
+        }
+
+        requestInitialPermissions()
+    }
+
+    private fun setupMap() {
+        mapView.setTileSource(TileSourceFactory.MAPNIK)
+        mapView.setMultiTouchControls(true)
+        mapView.controller.setZoom(15.0)
+        mapView.controller.setCenter(GeoPoint(19.9975, 73.7898))
+
+        val mapEventsReceiver = object : MapEventsReceiver {
+            override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
+                updateTargetLocation(p)
+                return true
+            }
+
+            override fun longPressHelper(p: GeoPoint): Boolean {
+                updateTargetLocation(p)
+                return true
+            }
+        }
+        mapView.overlays.add(MapEventsOverlay(mapEventsReceiver))
+    }
+
+    private fun setupSearchBar() {
+        val etSearchPlace = findViewById<EditText>(R.id.etSearchPlace)
+        val btnSearch = findViewById<Button>(R.id.btnSearch)
+
+        btnSearch.setOnClickListener {
+            val query = etSearchPlace.text.toString().trim()
+            if (query.isNotEmpty()) {
+                hideKeyboard(etSearchPlace)
+                searchLocationAndJump(query)
+            }
+        }
+
+        etSearchPlace.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                btnSearch.performClick()
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    private fun searchLocationAndJump(query: String) {
+        Toast.makeText(this, "Searching for \"$query\"...", Toast.LENGTH_SHORT).show()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val encodedQuery = URLEncoder.encode(query, "UTF-8")
+                val url = URL("https://nominatim.openstreetmap.org/search?q=$encodedQuery&format=json&limit=1")
+
+                val connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "$packageName/1.0")
+                    connectTimeout = 8000
+                    readTimeout = 8000
+                }
+
+                val responseText = connection.inputStream.bufferedReader().use { it.readText() }
+                val jsonArray = JSONArray(responseText)
+
+                withContext(Dispatchers.Main) {
+                    if (jsonArray.length() > 0) {
+                        val firstResult = jsonArray.getJSONObject(0)
+                        val lat = firstResult.getDouble("lat")
+                        val lon = firstResult.getDouble("lon")
+                        val displayName = firstResult.optString("display_name", query)
+
+                        val foundPoint = GeoPoint(lat, lon)
+                        myLocationOverlay?.disableFollowLocation()
+                        mapView.controller.animateTo(foundPoint, 15.5, 1000L)
+                        updateTargetLocation(foundPoint)
+                        tvSelectedCoords.text = displayName.substringBefore(",") +
+                                String.format(" (%.4f, %.4f)", lat, lon)
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Location not found. Try adding city name.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Search needs internet. Tap the map directly when offline.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun hideKeyboard(view: EditText) {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(view.windowToken, 0)
+    }
+
+    private fun enableUserLocationOnMap() {
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        if (myLocationOverlay == null) {
+            val overlay = MyLocationNewOverlay(GpsMyLocationProvider(this), mapView).apply {
+                enableMyLocation()
+                enableFollowLocation()
+            }
+            myLocationOverlay = overlay
+            mapView.overlays.add(overlay)
+        }
+    }
+
+    private fun updateTargetLocation(point: GeoPoint) {
+        selectedPoint = point
+        tvSelectedCoords.text = String.format("Target: %.5f, %.5f", point.latitude, point.longitude)
+
+        val marker = targetMarker ?: Marker(mapView).apply {
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+            title = "Alarm Destination"
+        }.also {
+            targetMarker = it
+            mapView.overlays.add(it)
+        }
+        marker.position = point
+
+        drawRadiusCircle(point, selectedRadiusMeters.toDouble())
+        mapView.invalidate()
+    }
+
+    private fun drawRadiusCircle(center: GeoPoint, radiusInMeters: Double) {
+        radiusCircle?.let { mapView.overlays.remove(it) }
+
+        val circle = Polygon().apply {
+            points = Polygon.pointsAsCircle(center, radiusInMeters)
+            fillPaint.color = Color.argb(50, 33, 150, 243)
+            outlinePaint.color = Color.rgb(33, 150, 243)
+            outlinePaint.strokeWidth = 4f
+        }
+        radiusCircle = circle
+        mapView.overlays.add(circle)
+        mapView.invalidate()
+    }
+
+    private fun setupRadiusSlider() {
+        seekBarRadius.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                selectedRadiusMeters = (progress + 100).toFloat()
+                tvRadiusLabel.text = "Alarm Radius: ${selectedRadiusMeters.toInt()} meters"
+
+                selectedPoint?.let { point ->
+                    drawRadiusCircle(point, selectedRadiusMeters.toDouble())
+                }
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+    }
+
+    private fun requestInitialPermissions() {
+        val perms = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        permissionLauncher.launch(perms.toTypedArray())
+    }
+
+    private fun validateAndStart() {
+        if (selectedPoint == null) {
+            Toast.makeText(this, "Tap on the map to pick a destination first!", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            Toast.makeText(this, "Please turn ON Location/GPS", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+            return
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestInitialPermissions()
+            return
+        }
+
+        checkBackgroundPermissionAndStart()
+    }
+
+    private fun checkBackgroundPermissionAndStart() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val bgGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_BACKGROUND_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!bgGranted) {
+                AlertDialog.Builder(this)
+                    .setTitle("Background Location Needed")
+                    .setMessage("Select 'Allow all the time' on the next screen so the alarm triggers while your screen is locked.")
+                    .setPositiveButton("Open Settings") { _, _ ->
+                        requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 200)
+                    }
+                    .setNegativeButton("Start Anyway") { _, _ ->
+                        startAlarmService()
+                    }
+                    .show()
+                return
+            }
+        }
+        startAlarmService()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 200) {
+            // Start the alarm after the background-permission prompt, granted or not
+            startAlarmService()
+        }
+    }
+
+    private fun startAlarmService() {
+        val point = selectedPoint ?: return
+
+        val serviceIntent = Intent(this, LocationAlarmService::class.java).apply {
+            putExtra("LAT", point.latitude)
+            putExtra("LNG", point.longitude)
+            putExtra("RADIUS", selectedRadiusMeters)
+        }
+
+        ContextCompat.startForegroundService(this, serviceIntent)
+        tvStatus.text = String.format(
+            "Status: Active | Target: %.4f, %.4f (%dm)",
+            point.latitude,
+            point.longitude,
+            selectedRadiusMeters.toInt()
+        )
+    }
+
+    override fun onResume() {
+        super.onResume()
+        mapView.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        mapView.onPause()
+    }
+}
