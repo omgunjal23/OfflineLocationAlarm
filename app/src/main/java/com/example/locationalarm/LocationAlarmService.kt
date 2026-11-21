@@ -1,7 +1,6 @@
 package com.example.locationalarm
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.app.*
 import android.content.Context
 import android.content.Intent
@@ -22,6 +21,7 @@ class LocationAlarmService : Service(), LocationListener {
     private var targetLat: Double = 0.0
     private var targetLng: Double = 0.0
     private var targetRadius: Float = 500f
+    private var targetName: String = "Selected Target"
 
     private var ringtone: Ringtone? = null
     private var vibrator: Vibrator? = null
@@ -31,6 +31,10 @@ class LocationAlarmService : Service(), LocationListener {
         const val CHANNEL_ID = "LocationAlarmChannel"
         const val NOTIFICATION_ID = 101
         const val ACTION_STOP = "ACTION_STOP_ALARM"
+        const val ACTION_DISTANCE_UPDATE = "com.example.locationalarm.DISTANCE_UPDATE"
+        const val EXTRA_DISTANCE_METERS = "EXTRA_DISTANCE_METERS"
+        const val EXTRA_ALARM_STOPPED = "EXTRA_ALARM_STOPPED"
+        const val PREFS_NAME = "LocationAlarmPrefs"
     }
 
     override fun onCreate() {
@@ -45,24 +49,34 @@ class LocationAlarmService : Service(), LocationListener {
             return START_NOT_STICKY
         }
 
-        // If the system restarts the service without data, stop instead of using (0,0)
-        if (intent == null || !intent.hasExtra("LAT") || !intent.hasExtra("LNG")) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        // Stop any existing alarm sound/updates before applying updated target
+        ringtone?.stop()
+        vibrator?.cancel()
+        isAlarmRinging = false
+        locationManager.removeUpdates(this)
 
-        targetLat = intent.getDoubleExtra("LAT", 0.0)
-        targetLng = intent.getDoubleExtra("LNG", 0.0)
-        targetRadius = intent.getFloatExtra("RADIUS", 500f)
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        targetLat = intent?.getDoubleExtra("LAT", prefs.getFloat("LAT", 0f).toDouble()) ?: 0.0
+        targetLng = intent?.getDoubleExtra("LNG", prefs.getFloat("LNG", 0f).toDouble()) ?: 0.0
+        targetRadius = intent?.getFloatExtra("RADIUS", prefs.getFloat("RADIUS", 500f)) ?: 500f
+        targetName = intent?.getStringExtra("NAME") ?: prefs.getString("NAME", "Selected Target") ?: "Selected Target"
+
+        // Save active state so reopening the app restores everything
+        prefs.edit()
+            .putBoolean("IS_ACTIVE", true)
+            .putFloat("LAT", targetLat.toFloat())
+            .putFloat("LNG", targetLng.toFloat())
+            .putFloat("RADIUS", targetRadius)
+            .putString("NAME", targetName)
+            .apply()
 
         val notification = buildNotification("Searching for GPS satellites...")
         startForeground(NOTIFICATION_ID, notification)
 
         startOfflineGpsTracking()
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
-    @SuppressLint("MissingPermission")
     private fun startOfflineGpsTracking() {
         if (ActivityCompat.checkSelfPermission(
                 this,
@@ -73,17 +87,17 @@ class LocationAlarmService : Service(), LocationListener {
             return
         }
 
+        // Immediately check last known GPS location so distance displays right away
+        locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.let { lastLoc ->
+            onLocationChanged(lastLoc)
+        }
+
         locationManager.requestLocationUpdates(
             LocationManager.GPS_PROVIDER,
             3000L,
-            10f,
+            5f,
             this
         )
-
-        // Check immediately in case the user is already inside the radius
-        locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.let {
-            onLocationChanged(it)
-        }
     }
 
     override fun onLocationChanged(currentLocation: Location) {
@@ -93,25 +107,40 @@ class LocationAlarmService : Service(), LocationListener {
         }
 
         val distanceInMeters = currentLocation.distanceTo(targetLocation)
+        val formattedDistance = formatDistance(distanceInMeters)
 
-        if (!isAlarmRinging) {
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.notify(
-                NOTIFICATION_ID,
-                buildNotification("Distance remaining: ${distanceInMeters.toInt()} meters")
-            )
+        // Save latest distance to SharedPreferences for when app is reopened
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putFloat("LAST_DISTANCE", distanceInMeters)
+            .apply()
+
+        // Broadcast live distance to MainActivity if open
+        val updateIntent = Intent(ACTION_DISTANCE_UPDATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_DISTANCE_METERS, distanceInMeters)
         }
+        sendBroadcast(updateIntent)
+
+        // Update persistent notification
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(
+            NOTIFICATION_ID,
+            buildNotification("Remaining: $formattedDistance ($targetName)")
+        )
 
         if (distanceInMeters <= targetRadius && !isAlarmRinging) {
             triggerLoudAlarm()
         }
     }
 
-    // Required on Android 7-10 where these have no default implementation
-    @Deprecated("Deprecated in Java")
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-    override fun onProviderEnabled(provider: String) {}
-    override fun onProviderDisabled(provider: String) {}
+    private fun formatDistance(meters: Float): String {
+        return if (meters >= 1000f) {
+            String.format("%.2f km (%d m)", meters / 1000f, meters.toInt())
+        } else {
+            "${meters.toInt()} meters"
+        }
+    }
 
     private fun triggerLoudAlarm() {
         isAlarmRinging = true
@@ -119,7 +148,7 @@ class LocationAlarmService : Service(), LocationListener {
         val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
 
-        ringtone = RingtoneManager.getRingtone(applicationContext, alarmUri)?.apply {
+        ringtone = RingtoneManager.getRingtone(applicationContext, alarmUri).apply {
             audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_ALARM)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
@@ -158,12 +187,29 @@ class LocationAlarmService : Service(), LocationListener {
         ringtone?.stop()
         vibrator?.cancel()
         locationManager.removeUpdates(this)
+
+        // Clear active alarm state
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("IS_ACTIVE", false)
+            .remove("LAST_DISTANCE")
+            .apply()
+
+        // Notify MainActivity if open
+        val stoppedIntent = Intent(ACTION_DISTANCE_UPDATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_ALARM_STOPPED, true)
+        }
+        sendBroadcast(stoppedIntent)
+
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     private fun buildNotification(contentText: String): Notification {
-        val openAppIntent = Intent(this, MainActivity::class.java)
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
         val pendingOpenIntent = PendingIntent.getActivity(
             this, 0, openAppIntent, PendingIntent.FLAG_IMMUTABLE
         )
@@ -182,7 +228,6 @@ class LocationAlarmService : Service(), LocationListener {
             .setContentIntent(pendingOpenIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop Alarm", pendingStopIntent)
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
             .build()
     }
 
@@ -199,7 +244,9 @@ class LocationAlarmService : Service(), LocationListener {
     }
 
     override fun onDestroy() {
-        stopAlarmAndService()
+        ringtone?.stop()
+        vibrator?.cancel()
+        locationManager.removeUpdates(this)
         super.onDestroy()
     }
 
