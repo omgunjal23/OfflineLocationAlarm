@@ -1,10 +1,13 @@
 package com.example.locationalarm
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.location.Location
 import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
@@ -54,8 +57,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvRadiusLabel: TextView
     private lateinit var seekBarRadius: SeekBar
     private lateinit var tvStatus: TextView
+    private lateinit var btnStartAlarm: Button
 
     private var selectedPoint: GeoPoint? = null
+    private var selectedTargetName: String = ""
     private var selectedRadiusMeters: Float = 500f
 
     private var targetMarker: Marker? = null
@@ -66,6 +71,24 @@ class MainActivity : AppCompatActivity() {
 
     private var searchJob: Job? = null
     private var currentSuggestions: List<PlaceSuggestion> = emptyList()
+
+    // Live receiver for distance updates from LocationAlarmService
+    private val distanceReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == LocationAlarmService.ACTION_DISTANCE_UPDATE) {
+                val stopped = intent.getBooleanExtra(LocationAlarmService.EXTRA_ALARM_STOPPED, false)
+                if (stopped) {
+                    tvStatus.text = "Status: Idle"
+                    btnStartAlarm.text = "Start Alarm"
+                } else {
+                    val meters = intent.getFloatExtra(LocationAlarmService.EXTRA_DISTANCE_METERS, -1f)
+                    if (meters >= 0f) {
+                        updateActiveStatusText(meters)
+                    }
+                }
+            }
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -98,12 +121,13 @@ class MainActivity : AppCompatActivity() {
         tvRadiusLabel = findViewById(R.id.tvRadiusLabel)
         seekBarRadius = findViewById(R.id.seekBarRadius)
         tvStatus = findViewById(R.id.tvStatus)
+        btnStartAlarm = findViewById(R.id.btnStartAlarm)
 
         setupMap()
         setupRadiusSlider()
         setupSearchBarWithAutocomplete()
 
-        findViewById<Button>(R.id.btnStartAlarm).setOnClickListener {
+        btnStartAlarm.setOnClickListener {
             validateAndStart()
         }
 
@@ -113,13 +137,64 @@ class MainActivity : AppCompatActivity() {
             }
             startService(stopIntent)
             tvStatus.text = "Status: Alarm Stopped"
+            btnStartAlarm.text = "Start Alarm"
         }
+
+        // Restore active alarm & target location if already running
+        restoreSavedAlarmState()
 
         requestInitialPermissions()
     }
 
+    private fun restoreSavedAlarmState() {
+        val prefs = getSharedPreferences(LocationAlarmService.PREFS_NAME, Context.MODE_PRIVATE)
+        val isActive = prefs.getBoolean("IS_ACTIVE", false)
+
+        if (isActive) {
+            val lat = prefs.getFloat("LAT", 0f).toDouble()
+            val lng = prefs.getFloat("LNG", 0f).toDouble()
+            val radius = prefs.getFloat("RADIUS", 500f)
+            val name = prefs.getString("NAME", "") ?: ""
+            val lastDistance = prefs.getFloat("LAST_DISTANCE", -1f)
+
+            selectedRadiusMeters = radius
+            seekBarRadius.progress = (radius.toInt() - 100).coerceIn(0, 1900)
+            tvRadiusLabel.text = "Alarm Radius: ${radius.toInt()} meters"
+
+            val savedPoint = GeoPoint(lat, lng)
+            updateTargetLocation(savedPoint, name)
+
+            // Center map on the active destination so user sees their pin immediately
+            mapView.controller.setCenter(savedPoint)
+            mapView.controller.setZoom(15.0)
+
+            btnStartAlarm.text = "Update Alarm"
+            updateActiveStatusText(if (lastDistance >= 0f) lastDistance else null)
+        }
+    }
+
+    private fun updateActiveStatusText(remainingMeters: Float?) {
+        val point = selectedPoint ?: return
+        val distStr = if (remainingMeters != null) {
+            if (remainingMeters >= 1000f) {
+                String.format("%.2f km (%d m)", remainingMeters / 1000f, remainingMeters.toInt())
+            } else {
+                "${remainingMeters.toInt()} meters"
+            }
+        } else {
+            "Calculating GPS..."
+        }
+
+        tvStatus.text = String.format(
+            "Status: Active | Remaining: %s\nTarget: %.4f, %.4f (%dm)",
+            distStr,
+            point.latitude,
+            point.longitude,
+            selectedRadiusMeters.toInt()
+        )
+    }
+
     private fun setupMap() {
-        // Esri World Street Map (free public tiles, no API key required)
         val esriStreetMap = object : OnlineTileSourceBase(
             "EsriWorldStreetMap",
             0, 19, 256, ".jpg",
@@ -140,12 +215,12 @@ class MainActivity : AppCompatActivity() {
 
         val mapEventsReceiver = object : MapEventsReceiver {
             override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
-                updateTargetLocation(p)
+                updateTargetLocation(p, "")
                 return true
             }
 
             override fun longPressHelper(p: GeoPoint): Boolean {
-                updateTargetLocation(p)
+                updateTargetLocation(p, "")
                 return true
             }
         }
@@ -260,10 +335,9 @@ class MainActivity : AppCompatActivity() {
         val foundPoint = GeoPoint(place.lat, place.lon)
         myLocationOverlay?.disableFollowLocation()
         mapView.controller.animateTo(foundPoint, 15.5, 1000L)
-        updateTargetLocation(foundPoint)
 
         val shortName = place.displayName.split(",").take(2).joinToString(",")
-        tvSelectedCoords.text = String.format("%s (%.4f, %.4f)", shortName, place.lat, place.lon)
+        updateTargetLocation(foundPoint, shortName)
     }
 
     private fun hideKeyboard(view: AutoCompleteTextView) {
@@ -278,30 +352,76 @@ class MainActivity : AppCompatActivity() {
             ) != PackageManager.PERMISSION_GRANTED
         ) return
 
+        val prefs = getSharedPreferences(LocationAlarmService.PREFS_NAME, Context.MODE_PRIVATE)
+        val isAlarmActive = prefs.getBoolean("IS_ACTIVE", false)
+
         if (myLocationOverlay == null) {
             myLocationOverlay = MyLocationNewOverlay(GpsMyLocationProvider(this), mapView).apply {
                 enableMyLocation()
-                enableFollowLocation()
+                // Only auto-pan to user's current position if there isn't an active alarm pin already shown
+                if (!isAlarmActive) {
+                    enableFollowLocation()
+                }
             }
             mapView.overlays.add(myLocationOverlay)
         }
     }
 
-    private fun updateTargetLocation(point: GeoPoint) {
+    private fun updateTargetLocation(point: GeoPoint, placeName: String) {
         selectedPoint = point
-        tvSelectedCoords.text = String.format("Target: %.5f, %.5f", point.latitude, point.longitude)
+        selectedTargetName = placeName
+
+        tvSelectedCoords.text = if (placeName.isNotEmpty()) {
+            String.format("%s (%.4f, %.4f)", placeName, point.latitude, point.longitude)
+        } else {
+            String.format("Target: %.5f, %.5f", point.latitude, point.longitude)
+        }
 
         if (targetMarker == null) {
             targetMarker = Marker(mapView).apply {
                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                title = "Alarm Destination"
+                title = placeName.ifEmpty { "Alarm Destination" }
             }
             mapView.overlays.add(targetMarker)
         }
         targetMarker?.position = point
+        targetMarker?.title = placeName.ifEmpty { "Alarm Destination" }
 
         drawRadiusCircle(point, selectedRadiusMeters.toDouble())
+        showEstimatedDistanceImmediately(point)
         mapView.invalidate()
+    }
+
+    // Shows immediate distance preview in the app right after picking a point
+    private fun showEstimatedDistanceImmediately(targetPoint: GeoPoint) {
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        val lastLoc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+            ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+
+        if (lastLoc != null) {
+            val targetLoc = Location("").apply {
+                latitude = targetPoint.latitude
+                longitude = targetPoint.longitude
+            }
+            val meters = lastLoc.distanceTo(targetLoc)
+            val prefs = getSharedPreferences(LocationAlarmService.PREFS_NAME, Context.MODE_PRIVATE)
+            if (prefs.getBoolean("IS_ACTIVE", false)) {
+                updateActiveStatusText(meters)
+            } else {
+                val distStr = if (meters >= 1000f) {
+                    String.format("%.2f km (%d m)", meters / 1000f, meters.toInt())
+                } else {
+                    "${meters.toInt()} meters"
+                }
+                tvStatus.text = "Status: Ready | Distance from you: $distStr"
+            }
+        }
     }
 
     private fun drawRadiusCircle(center: GeoPoint, radiusInMeters: Double) {
@@ -385,37 +505,4 @@ class MainActivity : AppCompatActivity() {
                         startAlarmService()
                     }
                     .show()
-                return
-            }
-        }
-        startAlarmService()
-    }
-
-    private fun startAlarmService() {
-        val point = selectedPoint ?: return
-
-        val serviceIntent = Intent(this, LocationAlarmService::class.java).apply {
-            putExtra("LAT", point.latitude)
-            putExtra("LNG", point.longitude)
-            putExtra("RADIUS", selectedRadiusMeters)
-        }
-
-        ContextCompat.startForegroundService(this, serviceIntent)
-        tvStatus.text = String.format(
-            "Status: Active | Target: %.4f, %.4f (%dm)",
-            point.latitude,
-            point.longitude,
-            selectedRadiusMeters.toInt()
-        )
-    }
-
-    override fun onResume() {
-        super.onResume()
-        mapView.onResume()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        mapView.onPause()
-    }
-}
+                retur
