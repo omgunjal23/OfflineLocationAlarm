@@ -1,6 +1,7 @@
 package com.example.locationalarm
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -72,7 +73,6 @@ class MainActivity : AppCompatActivity() {
     private var searchJob: Job? = null
     private var currentSuggestions: List<PlaceSuggestion> = emptyList()
 
-    // Live receiver for distance updates from LocationAlarmService
     private val distanceReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == LocationAlarmService.ACTION_DISTANCE_UPDATE) {
@@ -140,9 +140,7 @@ class MainActivity : AppCompatActivity() {
             btnStartAlarm.text = "Start Alarm"
         }
 
-        // Restore active alarm & target location if already running
         restoreSavedAlarmState()
-
         requestInitialPermissions()
     }
 
@@ -164,7 +162,6 @@ class MainActivity : AppCompatActivity() {
             val savedPoint = GeoPoint(lat, lng)
             updateTargetLocation(savedPoint, name)
 
-            // Center map on the active destination so user sees their pin immediately
             mapView.controller.setCenter(savedPoint)
             mapView.controller.setZoom(15.0)
 
@@ -234,7 +231,7 @@ class MainActivity : AppCompatActivity() {
         val adapter = ArrayAdapter<String>(
             this,
             android.R.layout.simple_dropdown_item_1line,
-            mutableListOf()
+            mutableListOf<String>()
         )
         etSearchPlace.setAdapter(adapter)
 
@@ -358,7 +355,6 @@ class MainActivity : AppCompatActivity() {
         if (myLocationOverlay == null) {
             myLocationOverlay = MyLocationNewOverlay(GpsMyLocationProvider(this), mapView).apply {
                 enableMyLocation()
-                // Only auto-pan to user's current position if there isn't an active alarm pin already shown
                 if (!isAlarmActive) {
                     enableFollowLocation()
                 }
@@ -392,7 +388,7 @@ class MainActivity : AppCompatActivity() {
         mapView.invalidate()
     }
 
-    // Shows immediate distance preview in the app right after picking a point
+    @SuppressLint("MissingPermission")
     private fun showEstimatedDistanceImmediately(targetPoint: GeoPoint) {
         if (ActivityCompat.checkSelfPermission(
                 this,
@@ -505,4 +501,16 @@ class MainActivity : AppCompatActivity() {
                         startAlarmService()
                     }
                     .show()
-                retur
+                return
+            }
+        }
+        startAlarmService()
+    }
+
+    private fun startAlarmService() {
+        val point = selectedPoint ?: return
+
+        val serviceIntent = Intent(this, LocationAlarmService::class.java).apply {
+            putExtra("LAT", point.latitude)
+            putExtra("LNG", point.longitude)
+           
