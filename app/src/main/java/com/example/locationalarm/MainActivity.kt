@@ -10,10 +10,13 @@ import android.os.Build
 import android.os.Bundle
 import android.preference.PreferenceManager
 import android.provider.Settings
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.widget.ArrayAdapter
+import android.widget.AutoCompleteTextView
 import android.widget.Button
-import android.widget.EditText
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -24,12 +27,14 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
@@ -56,6 +61,12 @@ class MainActivity : AppCompatActivity() {
     private var radiusCircle: Polygon? = null
     private var myLocationOverlay: MyLocationNewOverlay? = null
 
+    // Data class for autocomplete suggestions
+    data class PlaceSuggestion(val displayName: String, val lat: Double, val lon: Double)
+
+    private var searchJob: Job? = null
+    private var currentSuggestions: List<PlaceSuggestion> = emptyList()
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -73,11 +84,13 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        Configuration.getInstance().load(
+        val osmConfig = Configuration.getInstance()
+        osmConfig.load(
             applicationContext,
             PreferenceManager.getDefaultSharedPreferences(applicationContext)
         )
-        Configuration.getInstance().userAgentValue = packageName
+        // Unique User-Agent required by tile & search servers
+        osmConfig.userAgentValue = "OfflineLocationAlarmAndroid/1.0 (personal-commute-app)"
 
         setContentView(R.layout.activity_main)
 
@@ -89,7 +102,7 @@ class MainActivity : AppCompatActivity() {
 
         setupMap()
         setupRadiusSlider()
-        setupSearchBar()
+        setupSearchBarWithAutocomplete()
 
         findViewById<Button>(R.id.btnStartAlarm).setOnClickListener {
             validateAndStart()
@@ -107,7 +120,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupMap() {
-        mapView.setTileSource(TileSourceFactory.MAPNIK)
+        // Clear old cached 403 tiles if any exist
+        mapView.tileProvider.clearTileCache()
+
+        // Use CartoDB Voyager (clean, Google-Maps-style street tiles without 403 blocks)
+        val cartoVoyager = XYTileSource(
+            "CartoVoyager",
+            0, 19, 256, ".png",
+            arrayOf(
+                "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
+                "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
+                "https://c.basemaps.cartocdn.com/rastertiles/voyager/"
+            ),
+            "© OpenStreetMap contributors © CARTO"
+        )
+        mapView.setTileSource(cartoVoyager)
         mapView.setMultiTouchControls(true)
         mapView.controller.setZoom(15.0)
         mapView.controller.setCenter(GeoPoint(19.9975, 73.7898))
@@ -126,15 +153,71 @@ class MainActivity : AppCompatActivity() {
         mapView.overlays.add(MapEventsOverlay(mapEventsReceiver))
     }
 
-    private fun setupSearchBar() {
-        val etSearchPlace = findViewById<EditText>(R.id.etSearchPlace)
+    private fun setupSearchBarWithAutocomplete() {
+        val etSearchPlace = findViewById<AutoCompleteTextView>(R.id.etSearchPlace)
         val btnSearch = findViewById<Button>(R.id.btnSearch)
 
+        val adapter = ArrayAdapter<String>(
+            this,
+            android.R.layout.simple_dropdown_item_1line,
+            mutableListOf()
+        )
+        etSearchPlace.setAdapter(adapter)
+
+        // Fetch suggestions automatically as user types
+        etSearchPlace.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+
+            override fun afterTextChanged(s: Editable?) {
+                val query = s?.toString()?.trim() ?: ""
+                searchJob?.cancel()
+
+                if (query.length < 3) return
+
+                searchJob = lifecycleScope.launch {
+                    delay(450L) // Wait 450ms after user stops typing
+                    val results = fetchPlacesFromNominatim(query, limit = 5)
+                    if (results.isNotEmpty()) {
+                        currentSuggestions = results
+                        adapter.clear()
+                        adapter.addAll(results.map { it.displayName })
+                        adapter.notifyDataSetChanged()
+                        if (etSearchPlace.hasFocus()) {
+                            etSearchPlace.showDropDown()
+                        }
+                    }
+                }
+            }
+        })
+
+        // Handle user tapping a suggestion from the dropdown list
+        etSearchPlace.setOnItemClickListener { _, _, position, _ ->
+            if (position in currentSuggestions.indices) {
+                val chosen = currentSuggestions[position]
+                hideKeyboard(etSearchPlace)
+                jumpToPlace(chosen)
+            }
+        }
+
+        // Handle user clicking "Go" button
         btnSearch.setOnClickListener {
             val query = etSearchPlace.text.toString().trim()
             if (query.isNotEmpty()) {
                 hideKeyboard(etSearchPlace)
-                searchLocationAndJump(query)
+                lifecycleScope.launch {
+                    Toast.makeText(this@MainActivity, "Searching...", Toast.LENGTH_SHORT).show()
+                    val results = fetchPlacesFromNominatim(query, limit = 1)
+                    if (results.isNotEmpty()) {
+                        jumpToPlace(results[0])
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Place not found. Try adding city name.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
             }
         }
 
@@ -148,17 +231,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun searchLocationAndJump(query: String) {
-        Toast.makeText(this, "Searching for \"$query\"...", Toast.LENGTH_SHORT).show()
-
-        lifecycleScope.launch(Dispatchers.IO) {
+    private suspend fun fetchPlacesFromNominatim(query: String, limit: Int): List<PlaceSuggestion> =
+        withContext(Dispatchers.IO) {
+            val list = mutableListOf<PlaceSuggestion>()
             try {
                 val encodedQuery = URLEncoder.encode(query, "UTF-8")
-                val url = URL("https://nominatim.openstreetmap.org/search?q=$encodedQuery&format=json&limit=1")
+                val url = URL("https://nominatim.openstreetmap.org/search?q=$encodedQuery&format=json&limit=$limit")
 
                 val connection = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
-                    setRequestProperty("User-Agent", "$packageName/1.0")
+                    setRequestProperty("User-Agent", "OfflineLocationAlarmAndroid/1.0 (personal-commute-app)")
                     connectTimeout = 8000
                     readTimeout = 8000
                 }
@@ -166,40 +248,30 @@ class MainActivity : AppCompatActivity() {
                 val responseText = connection.inputStream.bufferedReader().use { it.readText() }
                 val jsonArray = JSONArray(responseText)
 
-                withContext(Dispatchers.Main) {
-                    if (jsonArray.length() > 0) {
-                        val firstResult = jsonArray.getJSONObject(0)
-                        val lat = firstResult.getDouble("lat")
-                        val lon = firstResult.getDouble("lon")
-                        val displayName = firstResult.optString("display_name", query)
-
-                        val foundPoint = GeoPoint(lat, lon)
-                        myLocationOverlay?.disableFollowLocation()
-                        mapView.controller.animateTo(foundPoint, 15.5, 1000L)
-                        updateTargetLocation(foundPoint)
-                        tvSelectedCoords.text = displayName.substringBefore(",") +
-                                String.format(" (%.4f, %.4f)", lat, lon)
-                    } else {
-                        Toast.makeText(
-                            this@MainActivity,
-                            "Location not found. Try adding city name.",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
+                for (i in 0 until jsonArray.length()) {
+                    val obj = jsonArray.getJSONObject(i)
+                    val displayName = obj.optString("display_name", query)
+                    val lat = obj.getDouble("lat")
+                    val lon = obj.getDouble("lon")
+                    list.add(PlaceSuggestion(displayName, lat, lon))
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Search needs internet. Tap the map directly when offline.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
+            } catch (_: Exception) {
+                // Ignore network errors while typing offline
             }
+            list
         }
+
+    private fun jumpToPlace(place: PlaceSuggestion) {
+        val foundPoint = GeoPoint(place.lat, place.lon)
+        myLocationOverlay?.disableFollowLocation()
+        mapView.controller.animateTo(foundPoint, 15.5, 1000L)
+        updateTargetLocation(foundPoint)
+
+        val shortName = place.displayName.split(",").take(2).joinToString(",")
+        tvSelectedCoords.text = String.format("%s (%.4f, %.4f)", shortName, place.lat, place.lon)
     }
 
-    private fun hideKeyboard(view: EditText) {
+    private fun hideKeyboard(view: AutoCompleteTextView) {
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(view.windowToken, 0)
     }
@@ -212,12 +284,11 @@ class MainActivity : AppCompatActivity() {
         ) return
 
         if (myLocationOverlay == null) {
-            val overlay = MyLocationNewOverlay(GpsMyLocationProvider(this), mapView).apply {
+            myLocationOverlay = MyLocationNewOverlay(GpsMyLocationProvider(this), mapView).apply {
                 enableMyLocation()
                 enableFollowLocation()
             }
-            myLocationOverlay = overlay
-            mapView.overlays.add(overlay)
+            mapView.overlays.add(myLocationOverlay)
         }
     }
 
@@ -225,14 +296,14 @@ class MainActivity : AppCompatActivity() {
         selectedPoint = point
         tvSelectedCoords.text = String.format("Target: %.5f, %.5f", point.latitude, point.longitude)
 
-        val marker = targetMarker ?: Marker(mapView).apply {
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-            title = "Alarm Destination"
-        }.also {
-            targetMarker = it
-            mapView.overlays.add(it)
+        if (targetMarker == null) {
+            targetMarker = Marker(mapView).apply {
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                title = "Alarm Destination"
+            }
+            mapView.overlays.add(targetMarker)
         }
-        marker.position = point
+        targetMarker?.position = point
 
         drawRadiusCircle(point, selectedRadiusMeters.toDouble())
         mapView.invalidate()
@@ -241,14 +312,13 @@ class MainActivity : AppCompatActivity() {
     private fun drawRadiusCircle(center: GeoPoint, radiusInMeters: Double) {
         radiusCircle?.let { mapView.overlays.remove(it) }
 
-        val circle = Polygon().apply {
+        radiusCircle = Polygon().apply {
             points = Polygon.pointsAsCircle(center, radiusInMeters)
             fillPaint.color = Color.argb(50, 33, 150, 243)
             outlinePaint.color = Color.rgb(33, 150, 243)
             outlinePaint.strokeWidth = 4f
         }
-        radiusCircle = circle
-        mapView.overlays.add(circle)
+        mapView.overlays.add(radiusCircle)
         mapView.invalidate()
     }
 
@@ -324,18 +394,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
         startAlarmService()
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 200) {
-            // Start the alarm after the background-permission prompt, granted or not
-            startAlarmService()
-        }
     }
 
     private fun startAlarmService() {
